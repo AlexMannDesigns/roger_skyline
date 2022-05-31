@@ -38,7 +38,7 @@ route get default
 
 In our case this is:
 
-10.11.245.254
+10.11.254.254
 
 We then need to change our netplan config file inside our VM:
 
@@ -50,7 +50,7 @@ network:
   ethernets:
     enp0s3: 								
       addresses: [10.11.254.253/30] 	//this is our static IP address and /30 subnet mask (confirmed on online IP calc)
-      gateway4: 10.11.245.254			//this is the default gateway for connections to the machine
+      gateway4: 10.11.254.254			//this is the default gateway for connections to the machine
       nameservers:
         addresses: [8.8.8.8,8.8.4.4]	//nameserver (DNS) returns the IP address/Default gateway
   version: 2
@@ -149,11 +149,30 @@ maxretry = 3					//sets the number of failed logins before an IP is banned
 
 each time a config file is editted, the fail2ban service should be restarted:
 
-sudo systemctl restart fail2ban
+sudo systemctl restart fail2banon
 
 Check banned currently banned IPs with the following CL:
 
 sudo fail2ban status sshd
+
+We must also set up a similar rule in our jail.local to cover us against DOS attacks. We can set up the rule like this:
+
+[http-get-dos]
+enabled = true
+port = http,https
+filter = http-get-dos
+logpath = /var/log/nginx/access.log
+maxretry = 300
+findtime = 300
+bantime = 600
+action = iptables-allports
+
+We then need to set up a filter for the rule. File path should be: /etc/fail2ban/filter.d/http-get-dos.conf Essentially, it will scan our nginx access logs for matching regex:
+
+[Definition]
+
+failregex = ^<HOST> -.*GET
+ignoreregex =
 
 - Set protection against scans on your VM’s open ports
 
@@ -188,7 +207,7 @@ nmap -p 1-65535 -T4 -A -v -PE -PS22,25,80 -PA21,23,80 <vm with portsentry IP>
 
 This will list off some information regarding the scanned ports of our vm. We can then check the /var/log/syslog for attackalert to confirm the scanning was noticed. 
 
-Howwever, no action will be taken unless we update our portsentry config file:
+However, no action will be taken unless we update our portsentry config file:
 
 grep -n “BLOCK_UDP=“ /etc/portsentry/portsentry.conf  //in our case this on line 135
 vim +135 /etc/portsentry/portsentry.conf
@@ -267,8 +286,8 @@ our update script will look like this:
 WRITE_TO_LOG=“tee -a /var/log/update_script.log”
 
 date | $WRITE_TO_LOG
-apt update | $WRITE_TO_LOG			//NB no ‘sudo’ needed as script will run as root 
-apt upgrade | $WRITE_TO_LOG
+apt update -y | $WRITE_TO_LOG			//NB no ‘sudo’ needed as script will run as root 
+apt upgrade -y | $WRITE_TO_LOG
 
 Including the date helps to identify what ran and when, if we check our log.
 ensure the script is set to executable (chmod 777 update.sh) and file starts with the line: #!/bin/bash
@@ -300,3 +319,118 @@ Then, update the root crontab with the following line to run the script at midni
 0 0 * * * sh /home/amann/scripts/update.sh
 
 NB: if the machine is not running, the cron jobs will not be triggered. Look into anacron (man anacron) if you’d like them to run when the machine is restarted. This is installed by default and is how ubuntu handles jobs in /etc/cron.{daily,weekly,monthly}
+
+Web part
+
+- Set a webserver available at either the VM’s IP or a host (init.login.com, for example).
+- You can use Nginx or Apache as a webserver package. 
+
+Nginx is the software which will allow our server to present web pages on a browser. To install it, follow the following steps:
+
+sudo apt update			 //as usual..
+sudo apt install nginx
+
+we can then run systemctl status nginx to check it is installed and running.
+
+We need to configure our firewall setting so that the page can be broadcast. By default, nginx will broadcast on port 80 and has a boilerplate html page to show it’s working.
+
+sudo ufw app list				//presents our nginx and any other apps on the machine (e.g. OpenSSH)
+sudo ufw allow ’Nginx Full’ 	//will enable us to broadcast both http and https (ssl) pages
+sudo ufw status					//will confirm our new rules have been added
+
+Now if we go to our server’s IP address in browser, we should see the default nginx page displayed.
+
+- Set a self-signed SSL on all of your services.
+
+Allows encrypted connections between our server and our users (https://..etc). As this is self-signed, we will still get security warnings when accessing the server from most browsers, as they require there to be some recognised 3rd party authorisation, but this is not needed for this project
+
+We can set up a self-signed ssl certificate with one command. This will create both our key and our certificate:
+
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt
+
+We will then be prompted for some basic details regarding our location and organisation. The most important is the Common Name (e.g. server FQDN or YOUR name) - here we should input the IP address of our server.
+
+We should also set up a strong Diffie-Hellman (DH) group, used for creating Forward Secrecy with clients (ensures that sensitive information isnt compromised during long sessions, usually the private key of the server). Warning, this takes a while:
+
+sudo openssl dhparam -out /etc/nginx/dhparam.pem 4096
+
+Next we need to create a configuration snippet which can then be used to adjust our server blocks so that SSL requests can be handled properly:
+
+sudo vim /etc/nginx/snippets/self-signed.conf
+
+Within the file, the ssl_certigificate and ssl_certificate_key directives need to be set to the files we created above:
+
+ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+
+We then need to configure another nginx snippet to set it up with a strong SSL cipher suite which will allow us ato enable some advanced settings and make the server more secure:
+
+sudo vim /etc/nginx/snippets/ssl_params.conf
+
+and add the lines (from cipherlist.eu):
+
+ssl_protocols TLSv1.3;
+ssl_prefer_server_ciphers on;
+ssl_dhparam /etc/nginx/dhparam.pem; 
+ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+ssl_ecdh_curve secp384r1;
+ssl_session_timeout  10m;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 8.8.8.8 8.8.4.4 valid=300s; //we’re just using the google DNS resolver for now
+resolver_timeout 5s;
+
+# Disable strict transport security for now. You can uncomment the following
+# line if you understand the implications.
+#add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+
+add_header X-Frame-Options DENY;
+add_header X-Content-Type-Options nosniff;
+add_header X-XSS-Protection "1; mode=block";
+
+because we are self-signing our ssl cert, ssl stapling will not be used. Nginx will output a warning, then turn this setting off and continue as normal.
+
+We now need to edit the configuration of our sites-available files, so that we can connect via ssl:
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	include snippets/self-signed.conf;
+	include snippets/ssl_params.conf;
+
+	root …. //nothing needs to be changed here and below
+
+	server_name ….
+
+	location…
+}
+
+//we then need a second server code block to handle the ssl redirect
+server {
+	listen 80;
+	listen [::]:80;
+
+	server_name …
+
+	return 302 https://$server_name$request_uri;
+}
+
+Next, we double check the firewall is set up to allow Nginx Full
+
+sudo ufw app list
+sudo ufw status
+sudo ufw allow ‘Nginx Full’ 			//if necessary
+sudo ufw delete allow ‘Nginx HTTP’	//if necessary
+sudo ufw status
+
+We can then restart nginx, which should output that our config files are OK, syntactically, but will also warn us there is no issuer cerificate for our ssl, so it cant use stapling.
+
+sudo nginx -t
+
+If we’re all good, we can safely restart nginx:
+
+sudo systemctl restart nginx
+
+We can then test in browser with https://<ip_address> - if all went well, we should change our config from return 302 to return 301, to ensure the redirect will be permanent and only encrypted traffic will be allowed.
